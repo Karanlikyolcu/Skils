@@ -1,0 +1,402 @@
+# Git Security & Commit Signing
+
+Credential management, commit signing setup, secret scanning, CVE reference, and hardening.
+
+Research date: September 2026.
+
+## Contents
+
+- Commit Signing Setup
+- Credential Management
+- Secret Scanning
+- Git CVE Reference (2024-2026)
+- Git Security Hardening
+- Git LFS
+
+---
+
+## Commit Signing Setup
+
+### SSH signing (recommended)
+
+The simplest path. Reuses existing SSH keys, no GPG keyring, works offline.
+
+```bash
+# Configure git to use SSH signing
+git config --global gpg.format ssh
+git config --global user.signingkey ~/.ssh/id_ed25519.pub
+git config --global commit.gpgsign true    # sign all commits
+git config --global tag.gpgSign true       # sign all tags
+
+# Allowed signers file (for offline verification)
+echo "$(git config user.email) $(cat ~/.ssh/id_ed25519.pub)" >> ~/.config/git/allowed_signers
+git config --global gpg.ssh.allowedSignersFile ~/.config/git/allowed_signers
+
+# Verify signing works
+probe_oid=$(printf '%s\n' "signing probe" | git commit-tree HEAD^{tree} -S) || exit 1
+git verify-commit "$probe_oid"
+```
+
+**Upload your SSH public key to each forge as a "Signing Key":**
+- **GitHub**: Settings > SSH and GPG keys > New SSH key > Key type: **Signing Key**
+  (separate from authentication keys)
+- **GitLab**: Preferences > SSH Keys > Usage type: **Signing** (or both)
+- **Forgejo**: Settings > SSH / GPG Keys > Add Key > type: signing
+
+### GPG signing
+
+More complex but offers key expiry, revocation, and key server distribution.
+
+```bash
+# Generate a GPG key (if you don't have one)
+gpg --full-generate-key
+# Choose: (1) RSA and RSA, 4096 bits, expiry 2y, your git email
+
+# Configure git
+git config --global user.signingkey <KEY_ID>
+git config --global commit.gpgsign true
+git config --global tag.gpgSign true
+
+# If using GPG agent (pinentry prompts for passphrase)
+echo "pinentry-program /usr/bin/pinentry-tty" >> ~/.gnupg/gpg-agent.conf
+gpg-connect-agent reloadagent /bye
+
+# Export public key for forge upload
+gpg --armor --export <KEY_ID>
+```
+
+**GPG agent caching**: by default, GPG agent caches the passphrase for 600 seconds. For
+longer sessions: `echo "default-cache-ttl 86400" >> ~/.gnupg/gpg-agent.conf`
+
+### gitsign (Sigstore) - keyless signing
+
+Zero key management. Uses OIDC identity (GitHub, Google, Microsoft). Best for open source.
+
+```bash
+# Install
+go install github.com/sigstore/gitsign@latest
+# Or: brew install sigstore/tap/gitsign
+
+# Configure (per-repo recommended, not global)
+git config commit.gpgsign true
+git config gpg.x509.program gitsign
+git config gpg.format x509
+
+# Sign - opens browser for OIDC auth
+git commit -S -m "signed commit"
+
+# Verify
+git verify-commit HEAD
+```
+
+**Limitations**: requires internet at sign time, ephemeral certificates (no GitHub vigilant mode),
+verification requires Sigstore infrastructure. Best for open source, not ideal for air-gapped
+or compliance environments.
+
+### 1Password SSH agent
+
+If you use 1Password, its SSH agent can sign git commits with keys stored in the vault.
+
+```bash
+# Configure git to use 1Password SSH agent
+git config --global gpg.format ssh
+git config --global user.signingkey "ssh-ed25519 AAAA... your@email.com"
+git config --global commit.gpgsign true
+
+# 1Password SSH agent socket (varies by platform)
+# macOS: ~/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock
+# Linux: ~/.1password/agent.sock
+export SSH_AUTH_SOCK=~/.1password/agent.sock
+```
+
+### Signing in CI/CD
+
+CI environments need signing without interactive passphrase prompts.
+
+```bash
+# GPG in CI: import key from secret, no passphrase (or preset passphrase)
+# Feed the key on stdin so it is never an argument to any process.
+gpg --batch --import <<<"$GPG_PRIVATE_KEY"
+git config user.signingkey <KEY_ID>
+git config commit.gpgsign true
+
+# SSH in CI: use deploy key as signing key
+umask 077
+signing_key=$(mktemp) || exit 1
+trap 'rm -f "$signing_key"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+# Populate through stdin so the key is never an argument to any process.
+cat > "$signing_key" <<<"$SSH_SIGNING_KEY"
+# Scope configuration to the signing operation; do not leave a deleted key path in config.
+git -c gpg.format=ssh -c user.signingkey="$signing_key" commit -S
+```
+
+---
+
+## Credential Management
+
+### Git credential helpers
+
+| Helper | Platform | Storage | Security level |
+|--------|----------|---------|----------------|
+| `osxkeychain` | macOS | Keychain | High (biometric) |
+| `libsecret` | Linux (GNOME) | GNOME Keyring | High (session-locked) |
+| `wincred` | Windows | Windows Credential Store | High |
+| `manager` (GCM) | Cross-platform | OS-native store | High |
+| `cache --timeout=3600` | Any | In-memory | Medium (auto-expires) |
+| `store` | Any | Plaintext `~/.git-credentials` | **DANGEROUS** |
+
+```bash
+# Recommended setup (Linux)
+git config --global credential.helper libsecret
+
+# With timeout fallback
+git config --global credential.helper 'cache --timeout=28800'  # 8 hours
+
+# Per-host credentials (different accounts for different forges)
+git config --global credential.https://github.com.helper 'cache --timeout=28800'
+git config --global credential.https://gitlab.example.com.helper libsecret
+```
+
+### SSH vs HTTPS remotes
+
+| Protocol | Auth | Firewall | Credential storage |
+|----------|------|----------|-------------------|
+| **SSH** | SSH key | Port 22 (may be blocked) | SSH agent |
+| **HTTPS** | Token/password | Port 443 (rarely blocked) | Credential helper |
+
+**Recommendation**: SSH for development machines (key-based, no token expiry), HTTPS for CI/CD
+(token-based, scoped, rotatable).
+
+### Token rotation
+
+- **GitHub PATs**: fine-grained tokens with expiry (90 days max recommended). Classic tokens
+  don't expire but should be rotated quarterly.
+- **GitLab tokens**: project/group access tokens with expiry. Service accounts for CI.
+- **Forgejo tokens**: personal access tokens. No fine-grained scoping yet.
+
+---
+
+## Secret Scanning
+
+### Tools
+
+| Tool | Scope | Speed | False positive rate |
+|------|-------|-------|-------------------|
+| `gitleaks` 8.30.x | Current + history | Fast | Low |
+| `trufflehog` 3.x | Current + history | Medium | Very low (verified) |
+| `detect-secrets` | Current only | Fast | Medium |
+| GitHub secret scanning | Push-time | Real-time | Low (pattern-based) |
+| GitLab secret detection | CI pipeline | CI-speed | Medium |
+
+### Scanning workflow
+
+```bash
+# Quick scan (current state only)
+gitleaks detect --source . --no-git
+
+# Full history scan
+gitleaks detect --source . --log-opts="--all"
+
+# Scan staged changes only (pre-commit hook)
+gitleaks protect --staged
+
+# Scan with trufflehog (verifies against live APIs)
+trufflehog filesystem . --only-verified
+trufflehog git . --since-commit=HEAD~20
+```
+
+### Pre-commit hook for secret detection
+
+```yaml
+# .pre-commit-config.yaml
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1  # pin to specific version, check for latest
+    hooks:
+      - id: gitleaks
+```
+
+Or with `lefthook`:
+
+```yaml
+# lefthook.yml
+pre-commit:
+  commands:
+    gitleaks:
+      run: gitleaks protect --staged --no-banner
+```
+
+### Secret remediation
+
+When a secret is found in git history:
+
+1. **Rotate the secret immediately.** Assume it's compromised. Scrubbing history removes
+   future exposure, not past.
+2. **Scrub from history** using `git-filter-repo`:
+
+```bash
+# Populate this mode-0600 temporary file from a secret manager or no-echo stdin.
+: "${GIT_FILTER_REPO_REPLACEMENTS:?set a mode-0600 replacement file}"
+git filter-repo --replace-text "$GIT_FILTER_REPO_REPLACEMENTS"
+rm -f "$GIT_FILTER_REPO_REPLACEMENTS"
+unset GIT_FILTER_REPO_REPLACEMENTS
+
+# Or remove entire files that contained secrets
+git filter-repo --invert-paths --path .env.production
+
+# Force-push all branches and tags
+git push origin --force --all
+git push origin --force --tags
+```
+
+3. **Coordinate with team** - force-push rewrites history. Everyone needs to re-clone or
+   `git fetch --all && git reset --hard origin/main`.
+4. **Update forge** - GitHub/GitLab cache old objects. Contact support for immediate purge,
+   or wait for GC (varies by forge).
+5. **Add to `.gitignore`** to prevent recurrence.
+
+---
+
+## Git CVE Reference (2024-2026)
+
+### git (core)
+
+| CVE | Version | Severity | Description |
+|-----|---------|----------|-------------|
+| CVE-2025-48384 | < 2.50.1 | **Critical (8.1)** | Arbitrary file write via `\r` in `.gitmodules` during recursive clone. **Actively exploited** - CISA KEV. |
+| CVE-2025-48385 | < 2.50.1 | High | Bundle URI validation bypass - protocol injection, potential RCE |
+| CVE-2025-48386 | < 2.50.1 | Medium | Buffer overflow in `wincred` credential helper (Windows only) |
+| CVE-2024-32002 | < 2.45.1 | Critical (9.1) | Recursive clone RCE via symlink + submodule (case-insensitive FS: Windows/macOS) |
+| CVE-2024-50349 | < 2.48.1 | Medium | Credential leak via terminal escape in URL (Clone2Leak disclosure) |
+| CVE-2024-52006 | < 2.48.1 | Medium | Carriage return smuggling in credential protocol (same Clone2Leak disclosure as CVE-2024-50349) |
+
+**Action**: ensure git >= 2.50.1 (ideally 2.55.x). CVE-2025-48384 is **actively exploited in the
+wild** - a weaponized `.gitmodules` file can overwrite hook scripts to achieve RCE on `git clone
+--recursive`. Patched in v2.50.1, v2.49.1, v2.48.2, v2.47.3, and backports. Linux and macOS
+affected; Windows is not.
+
+### Git for Windows (checked September 10, 2026)
+
+[CVE-2026-62960](https://github.com/git-for-windows/git/security/advisories/GHSA-xrpg-8j9v-v282)
+allows an untrusted server's bundle URI to trigger an outbound SMB connection when
+`transfer.bundleuri=true`. The advisory confirms 2.53.0.windows.3 and the tested main
+revision as affected and lists no patched version; [NVD](https://nvd.nist.gov/vuln/detail/CVE-2026-62960) reports a fix in
+2.55.0.windows.4 (checked September 25, sources still disagree). Keep bundle URI transfer disabled for
+untrusted Windows remotes and check the advisory before claiming a newer Git release fixes
+this issue. SMB callback is confirmed; NTLM disclosure is a stated risk, not a captured
+credential result in the advisory.
+
+### Supply chain (git-adjacent)
+
+| Incident | Date | Impact |
+|----------|------|--------|
+| tj-actions/changed-files (CVE-2025-30066) | March 2025 | GitHub Actions supply chain. Malicious code via compromised `reviewdog` maintainer account (CVE-2025-30154). Secrets exfiltrated from 23k+ repos. Targeted Coinbase agentkit (partially thwarted). |
+| TeamPCP campaign (CVE-2026-33634) | March 2026 | Trivy Docker Hub credential-stealing malware (v0.69.4-6). Same campaign hit Checkmarx KICS Actions (35 tags hijacked) and LiteLLM PyPI (backdoored v1.82.7/v1.82.8, 95M downloads/month). |
+| xz utils backdoor (CVE-2024-3094) | March 2024 | Backdoor in xz 5.6.0/5.6.1 targeting SSH. |
+
+### Git forge vulnerabilities
+
+| CVE | Forge | Severity | Description |
+|-----|-------|----------|-------------|
+| CVE-2025-68937 | Forgejo <= v13.0.1 | Critical (9.5) | Template processing allows authenticated RCE via symlink to `.ssh/authorized_keys`. Fixed in v13.0.2+ and v11.0.7 (LTS). |
+| CVE-2025-11702 | GitLab | High (8.5) | Runner hijacking - authenticated users could hijack project runners from other projects. Fixed in 18.3.5/18.4.3/18.5.1. |
+| CVE-2025-25291/25292 | GitLab | Critical | SAML SSO authentication bypass - user impersonation. Fixed in 17.7.7 / 17.8.5 / 17.9.2. |
+| CVE-2025-8110 | Gogs | High (8.7) | Symlink bypass RCE, exploited as a zero-day. 700+ compromised instances. Fixed in v0.13.4 (Jan 2026). |
+
+### AI tooling and MCP vulnerabilities
+
+| CVE | Component | Severity | Description |
+|-----|-----------|----------|-------------|
+| CVE-2025-68143 | Anthropic MCP Git server | Moderate (6.5) | Path traversal in `git_init` - arbitrary filesystem access. Fixed 2025.9.25. |
+| CVE-2025-68144 | Anthropic MCP Git server | Moderate (6.3) | Argument injection in `git_diff`/`git_checkout`. Fixed 2025.12.18. |
+| CVE-2025-65964 | n8n | Critical (9.4) | RCE via `core.hooksPath` exploitation in Git hooks. |
+
+**MCP + Filesystem server chaining**: combining the Git MCP server with the Filesystem MCP server
+created a toxic attack surface enabling full code execution from prompt injection.
+
+### Malicious project configs
+
+AI tool project configs (`.claude/`, `.cursor/`, `.vscode/tasks.json`, `.idea/runConfigurations/`)
+can define hooks or tasks that execute arbitrary code when a developer opens the project.
+
+**Mitigation**: treat all project config dirs in cloned repos as untrusted. Review hook configs
+before opening a project from an untrusted source. `core.hooksPath` is a security-sensitive
+setting - if an attacker controls it, they control code execution.
+
+---
+
+## Git Security Hardening
+
+### Per-user configuration
+
+```bash
+# Refuse to clone/fetch from repos with suspicious ownership
+# Never set safe.directory to '*'; the wildcard disables the ownership check entirely.
+# Add specific trusted directories instead:
+git config --global --add safe.directory /home/user/projects/repo
+
+# Disable credential helper fallback to plaintext
+git config --global credential.helper ''
+
+# Require signed commits for verification
+git config --global merge.verifySignatures true  # reject unsigned merges
+git config --global log.showSignature true       # always show signatures in log
+
+# Prevent accidental pushes to wrong remote
+git config --global push.default current  # only push current branch, not all matching
+git config --global push.autoSetupRemote true  # auto-track on first push (git 2.37+, single-remote repos only)
+```
+
+### Repository-level hardening
+
+```bash
+# Reject non-fast-forward updates and deletions; these do NOT verify signatures.
+# Enforce signed commits with forge rulesets or a reviewed signature-verifying receive hook.
+git config receive.denyNonFastForwards true
+git config receive.denyDeletes true
+
+# Transfer size limits (prevent repo bombs)
+git config pack.packSizeLimit 100m
+git config receive.maxInputSize 104857600  # 100MB
+```
+
+### Cloning untrusted repositories
+
+When cloning repos from untrusted sources:
+
+1. **Don't use `--recurse-submodules`** until you've reviewed `.gitmodules`
+2. **Check for suspicious hooks** in `.githooks/`, `.husky/`, `.pre-commit-config.yaml`
+3. **Check for project configs** that auto-execute (`.claude/`, `.vscode/tasks.json`, `Makefile` targets)
+4. **Review CI configs** that might run on fork PRs (`.github/workflows/`, `.gitlab-ci.yml`)
+5. **Use `--depth 1`** if you only need the latest state (limits exposure to history-based attacks)
+
+---
+
+## Git LFS
+
+For repositories with large binary files (design assets, ML models, data files).
+
+```bash
+# Install and set up
+git lfs install
+
+# Track file patterns
+git lfs track "*.psd"
+git lfs track "*.zip"
+git lfs track "models/**"
+
+# Verify tracking
+git lfs ls-files
+
+# Migrate existing large files to LFS
+git lfs migrate import --include="*.psd" --everything
+```
+
+**LFS gotchas**:
+- LFS storage is separate from git storage. GitHub free tier: 10 GiB storage, 10 GiB/month bandwidth (checked 2026-09-17; see [Git LFS billing](https://docs.github.com/en/billing/concepts/product-billing/git-lfs)).
+- With Git LFS installed, checkout normally smudges pointers into file content. If smudging is skipped or unavailable, `git lfs pull` fetches and checks out the content.
+- Self-hosted LFS requires a separate LFS server (Forgejo includes one).
+- LFS files don't show meaningful diffs (they're pointers). Configure Git diff drivers/textconv in `.gitattributes` for suitable formats.
+  Git LFS has no `git lfs diff` subcommand.

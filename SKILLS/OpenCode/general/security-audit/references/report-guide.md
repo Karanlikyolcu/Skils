@@ -1,0 +1,96 @@
+# Security Audit: Report Guide
+
+Reference material for generating the final audit report. Includes severity classification, OWASP mapping, and report template.
+
+## Severity Classification
+
+| Severity | Criteria | Examples |
+|----------|----------|----------|
+| **P0** | Unauthenticated RCE, credential exfiltration, full auth bypass, arbitrary file write | Unauthed admin endpoint returns all API keys; zip slip with root container |
+| **P1** | Authenticated RCE, privilege escalation, SSRF to internal services, path traversal with write | Non-admin can access admin routes; SSRF bypasses IP allowlist |
+| **P2** | Stored XSS, CSRF, information disclosure (stack traces, internal paths), weak crypto | SHA-256 password hashing; verbose error responses in production |
+| **P3** | Reflected XSS (limited), verbose errors in dev mode, missing security headers, TLS config issues | Missing HSTS header; `rejectUnauthorized: false` with opt-in flag |
+| **info** | Best practice deviations, missing governance files, unpinned actions | No SECURITY.md; actions pinned to tags not SHAs; no SBOM |
+
+## OWASP Top 10:2025 Quick Reference
+
+Tag each finding to the correct category.
+
+| ID | Category | Key Checks |
+|----|----------|------------|
+| A01 | Broken Access Control | Auth bypass, IDOR, privilege escalation, missing function-level auth |
+| A02 | Security Misconfiguration | Default creds, verbose errors, CORS *, unnecessary features enabled, permissive headers |
+| A03 | Software Supply Chain Failures | Unpinned deps, no lockfile integrity, compromised/known-CVE packages, abandoned deps, no update automation, no SBOM, mutable CI actions |
+| A04 | Cryptographic Failures | Weak/legacy ciphers, hardcoded keys, missing encryption in transit/at rest, weak hashing, predictable randomness |
+| A05 | Injection | SQL, NoSQL, OS command, LDAP, XSS, template injection, header injection |
+| A06 | Insecure Design | Missing rate limiting, no abuse case analysis, client-controlled security state |
+| A07 | Authentication Failures | Weak passwords, broken session management, missing MFA, credential stuffing exposure |
+| A08 | Software or Data Integrity Failures | Unsigned updates, insecure deserialization, CI/CD pipeline manipulation |
+| A09 | Security Logging and Alerting Failures | No audit trail, unmonitored auth failures, no alerting, sensitive data in logs |
+| A10 | Mishandling of Exceptional Conditions | Fail-open behavior, unhandled errors exposing state, silent error swallowing |
+
+## Report Template
+
+Save to `docs/local/audits/security-audit/<YYYY-MM-DD>-<slug>.md`. Verify `docs/local/` is gitignored before writing because the report contains vulnerability details.
+
+```
+# Security Audit Report
+
+**Date**: YYYY-MM-DD
+**Scope**: [files/directories audited]
+**Commit**: [short SHA]
+**Tools used**: [list of tools that ran successfully]
+**Tools skipped**: [list of tools not available, with install commands]
+
+## Executive Summary
+
+X findings: N P0, N P1, N P2, N P3, N info.
+[1-3 sentence overall assessment]
+
+## Findings
+
+### [SEV-NNN] [P0|P1|P2|P3|info]: [Title]
+
+**OWASP**: [A01:2025 - Category Name]
+**CWE**: [CWE-NNN if applicable]
+**Location**: `file:line` (or `multiple files` with list)
+**Description**: [What the vulnerability is]
+**Impact**: [What an attacker can do - be specific about preconditions and blast radius]
+**Evidence**:
+[code snippet, tool output, or reproduction steps]
+**Remediation**: [Specific fix with code example where possible]
+**References**: [Links to CWE, OWASP guide, or relevant documentation]
+
+---
+
+[repeat for each finding, ordered by severity then by pass number]
+
+## Pass Summary
+
+| Pass | Method | Tool | Findings | Status |
+|------|--------|------|----------|--------|
+| 1 | Secret Scanning | gitleaks / trufflehog / manual | N | Done/Skipped |
+| 2 | Dependency Audit | bun audit / trivy | N | Done/Skipped |
+| 3 | Agentic AI & Supply Chain | Agent config, MCP, hooks, automation, provenance | N | Done/Skipped |
+| 4 | Static Analysis | semgrep / bandit | N | Done/Skipped |
+| 5 | Auth & Authz Review | Manual | N | Done |
+| 6 | Injection & Input | Manual + grep | N | Done |
+| 7 | Crypto & Data | Manual | N | Done |
+| 8 | Container & Infra | Manual | N | Done |
+| 9 | CI/CD & Supply Chain | Manual | N | Done |
+
+## Tool Installation Reference
+
+[For each skipped tool, provide install command]:
+- betterleaks: see https://github.com/betterleaks/betterleaks for current install options (gitleaks successor, same author)
+- semgrep: `pip install semgrep` or `brew install semgrep`
+- gitleaks: `brew install gitleaks` or `go install github.com/gitleaks/gitleaks/v8@latest`
+- trufflehog: `brew install trufflehog` or `go install github.com/trufflesecurity/trufflehog/v3@latest`
+- trivy: `brew install trivy` or see https://aquasecurity.github.io/trivy (use v0.74.0+ from official releases; v0.69.3 was the March 2026 incident rollback; never use v0.69.4-0.69.6)
+- scorecard: `go install github.com/ossf/scorecard/v5/cmd/scorecard@latest`
+- checkov: `pip install checkov`
+
+## Methodology Notes
+
+[Any context about scope limitations, areas not covered, or assumptions made]
+```
